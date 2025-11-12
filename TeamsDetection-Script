@@ -1,0 +1,97 @@
+<#
+.SYNOPSIS
+  Detects presence of vulnerable Microsoft Teams versions (non-approved) on a device.
+  Used as the Detection script for Intune Proactive Remediation.
+.NOTES
+  Author: Mohd Farhan
+  Requires: Administrator privileges
+#>
+
+# ------- CONFIG -------
+$ApprovedVersions = @(
+  "25275.2601.4002.2815","25290.205.4069.4894","25212.2204.3869.2204","25241.203.3947.4411",
+  "25255.703.3978.7153","25126.1415.3698.6812","25198.1112.3855.2900","25163.3611.3774.6315",
+  "25227.203.3915.2444","25189.1109.3837.4725","25185.410.3812.8024","25227.205.3936.6644"
+)
+
+$VulnerableFound = $false
+
+function Check-Version {
+    param($ver)
+    if ([string]::IsNullOrWhiteSpace($ver)) { return $true }  # empty version = assume vulnerable
+    return ($ApprovedVersions -notcontains $ver)
+}
+
+# ------- 1. PER-USER INSTALLS -------
+Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    $exe = "$($_.FullName)\AppData\Local\Microsoft\Teams\current\Teams.exe"
+    if (Test-Path $exe) {
+        try {
+            $ver = (Get-Item $exe).VersionInfo.ProductVersion
+            if (Check-Version $ver) {
+                Write-Output "Vulnerable Teams version $ver found for user $($_.Name)"
+                $VulnerableFound = $true
+            } else {
+                Write-Output "Approved Teams version ($ver) for user $($_.Name)"
+            }
+        } catch { }
+    }
+}
+
+# ------- 2. MACHINE-WIDE INSTALLER -------
+$mw = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
+      Where-Object { $_.DisplayName -match "Teams Machine-Wide Installer" }
+
+if ($mw) {
+    $ver = $mw.DisplayVersion
+    if (Check-Version $ver) {
+        Write-Output "Vulnerable Machine-Wide Teams version $ver"
+        $VulnerableFound = $true
+    } else {
+        Write-Output "Approved Machine-Wide Installer version $ver"
+    }
+}
+
+# ------- 3. WINDOWS APPS (MSIX) -------
+$appsDir = "C:\Program Files\WindowsApps"
+if (Test-Path $appsDir) {
+    Get-ChildItem $appsDir -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "MSTeams*" } | ForEach-Object {
+        if ($_.Name -match "\d+\.\d+\.\d+\.\d+") {
+            $ver = $matches[0]
+            if (Check-Version $ver) {
+                Write-Output "Vulnerable WindowsApps Teams version $ver in $($_.Name)"
+                $VulnerableFound = $true
+            } else {
+                Write-Output "Approved WindowsApps Teams version ($ver)"
+            }
+        }
+    }
+}
+
+# ------- 4. REGISTRY CHECK (user + machine uninstall keys) -------
+$allKeys = @(
+  "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+  "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+)
+foreach ($key in $allKeys) {
+    Get-ChildItem $key -ErrorAction SilentlyContinue | Where-Object {
+        (Get-ItemProperty $_.PsPath -ErrorAction SilentlyContinue).DisplayName -match "Teams"
+    } | ForEach-Object {
+        $dv = (Get-ItemProperty $_.PsPath -ErrorAction SilentlyContinue).DisplayVersion
+        if (Check-Version $dv)) {
+            Write-Output "Registry uninstall entry for vulnerable Teams version $dv"
+            $VulnerableFound = $true
+        } else {
+            Write-Output "Registry entry shows approved version $dv"
+        }
+    }
+}
+
+# ------- EXIT CODE -------
+if ($VulnerableFound) {
+    Write-Output "`nResult: Vulnerable Teams version(s) detected. Remediation required."
+    exit 1   # non-compliant → triggers remediation
+} else {
+    Write-Output "`nResult: All Teams installations are approved and up-to-date."
+    exit 0   # compliant
+}
