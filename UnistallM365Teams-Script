@@ -157,4 +157,35 @@ foreach($store in $AppxStores){
   }
 }
 
-Log "✅ Teams remediation + registry cleanup complete."
+# --- STEP: Final deep registry cleanup for stale Teams entries ---
+Write-Log "Starting deep registry cleanup for leftover Teams registry entries..."
+
+$RegPaths = @(
+  "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+  "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+  "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+  "HKCU:\SOFTWARE\Microsoft\Office\Teams",
+  "HKCU:\SOFTWARE\Microsoft\Teams"
+)
+
+foreach ($path in $RegPaths) {
+    if (Test-Path $path) {
+        Get-ChildItem $path -ErrorAction SilentlyContinue | ForEach-Object {
+            try {
+                $props = Get-ItemProperty $_.PsPath -ErrorAction SilentlyContinue
+                if ($props.DisplayName -match "Teams") {
+                    $ver = $props.DisplayVersion
+                    if ([string]::IsNullOrWhiteSpace($ver) -or ($ver -match "1\.25\.24601")) {
+                        Write-Log "Removing stale registry entry: $($_.PsPath) (version: $ver)"
+                        Remove-Item $_.PsPath -Recurse -Force -ErrorAction SilentlyContinue
+                    }
+                }
+            } catch { }
+        }
+    }
+}
+Write-Log "Registry cleanup completed."
+
+
+
+Log "Teams remediation + registry cleanup complete."
