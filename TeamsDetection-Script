@@ -78,7 +78,7 @@ foreach ($key in $allKeys) {
         (Get-ItemProperty $_.PsPath -ErrorAction SilentlyContinue).DisplayName -match "Teams"
     } | ForEach-Object {
         $dv = (Get-ItemProperty $_.PsPath -ErrorAction SilentlyContinue).DisplayVersion
-        if (Check-Version $dv)) {
+        if (Check-Version $dv) {
             Write-Output "Registry uninstall entry for vulnerable Teams version $dv"
             $VulnerableFound = $true
         } else {
