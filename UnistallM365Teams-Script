@@ -186,6 +186,28 @@ foreach ($path in $RegPaths) {
 }
 Write-Log "Registry cleanup completed."
 
+# --- STEP: Deep cleanup for HKU per-user uninstall entries ---
+Write-Log "Checking HKEY_USERS hives for stale Teams uninstall keys..."
+
+Get-ChildItem "HKU:\" -ErrorAction SilentlyContinue | ForEach-Object {
+    $sid = $_.PSChildName
+    $keyPath = "HKU:\$sid\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Teams"
+    if (Test-Path $keyPath) {
+        try {
+            $props = Get-ItemProperty $keyPath -ErrorAction SilentlyContinue
+            $ver = $props.DisplayVersion
+            if ([string]::IsNullOrWhiteSpace($ver) -or ($ApprovedVersions -notcontains $ver)) {
+                Write-Log "Removing per-user Teams uninstall key under $sid (version: $ver)"
+                Remove-Item $keyPath -Recurse -Force -ErrorAction SilentlyContinue
+            } else {
+                Write-Log "Approved version found in HKU\$sid, keeping key."
+            }
+        } catch {
+            Write-Log "Error accessing $keyPath : $_"
+        }
+    }
+}
+Write-Log "Completed HKU hive cleanup."
 
 
 Log "Teams remediation + registry cleanup complete."
