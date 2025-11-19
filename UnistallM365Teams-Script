@@ -139,6 +139,28 @@ if(Test-Path $appsDir){
     }
 }
 
+# --- STEP: Clean unexpected Teams installs in C:\ProgramData\<User>\Microsoft\Teams ---
+
+$pdRoot = "C:\ProgramData"
+Get-ChildItem $pdRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    $maybeUser = $_.FullName
+    $teamsPath = Join-Path $maybeUser "Microsoft\Teams\current\Teams.exe"
+
+    if (Test-Path $teamsPath) {
+        Write-Log "Found unexpected Teams install at: $teamsPath"
+
+        # Remove whole Microsoft\Teams folder
+        $rootFolder = Join-Path $maybeUser "Microsoft\Teams"
+        try {
+            Remove-Item $rootFolder -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Log "Removed Teams folder under ProgramData: $rootFolder"
+        } catch {
+            Write-Log "Failed to remove: $rootFolder. Error: $_"
+        }
+    }
+}
+
+
 # ------- APPX REGISTRY STUBS (defender evidence sometimes lingers here) -------
 $AppxStores = @(
   "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\Applications",
