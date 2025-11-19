@@ -1,8 +1,9 @@
-<# 
+<#
 Remediate vulnerable Microsoft Teams versions + clear Defender evidence.
 - Removes any Teams version NOT in $ApprovedVersions (per-user, MSI, MSIX)
 - Cleans registry for all user hives (even when the user is not logged in)
-- Leaves approved/safe versions in place
+- Removes ProgramData ghost installs
+- Removes AppX/MSIX WindowsApps versions with SYSTEM ACL FIX
 #>
 
 # ------- CONFIG -------
@@ -11,225 +12,246 @@ $ApprovedVersions = @(
   "25255.703.3978.7153","25126.1415.3698.6812","25198.1112.3855.2900","25163.3611.3774.6315",
   "25227.203.3915.2444","25189.1109.3837.4725","25185.410.3812.8024","25227.205.3936.6644"
 )
+
 $Log = "C:\ProgramData\UFCW_TeamsCleanup.log"
 New-Item -ItemType Directory -Path (Split-Path $Log) -Force | Out-Null
-function Log($m){("[{0}] {1}" -f (Get-Date -f "yyyy-MM-dd HH:mm:ss"),$m) | Out-File $Log -Append}
 
-# ------- HELPERS -------
-function Remove-PerUserTeams($profilePath){
-  $exe = Join-Path $profilePath "AppData\Local\Microsoft\Teams\current\Teams.exe"
-  if(!(Test-Path $exe)){ return }
-  $ver = (Get-Item $exe).VersionInfo.ProductVersion
-  Log "User '$profilePath' Teams.exe version: $ver"
-  if($ApprovedVersions -contains $ver){ Log "Approved version; skip per-user removal."; return }
-
-  $upd = Join-Path $profilePath "AppData\Local\Microsoft\Teams\Update.exe"
-  if(Test-Path $upd){ Start-Process $upd -ArgumentList "--uninstall -s" -Wait }
-  foreach($p in @("AppData\Local\Microsoft\Teams","AppData\Roaming\Microsoft\Teams")){
-    $full = Join-Path $profilePath $p
-    if(Test-Path $full){ Remove-Item $full -Recurse -Force -ErrorAction SilentlyContinue }
-  }
-  Log "Per-user Teams removed for '$profilePath'."
+function Log {
+    param([string]$m)
+    ("[{0}] {1}" -f (Get-Date -f "yyyy-MM-dd HH:mm:ss"),$m) | Out-File $Log -Append
 }
 
-function Clean-RegistryForHive($HiveRoot){ # e.g. HKU:\TempHive-<name> OR HKCU:\ (if running user-context)
+Log "===== Starting Teams remediation run ====="
+
+
+# ------- HELPERS -------
+function Remove-PerUserTeams {
+  param([string]$profilePath)
+
+  $exe = Join-Path $profilePath "AppData\Local\Microsoft\Teams\current\Teams.exe"
+  if (!(Test-Path $exe)) { return }
+
+  $ver = (Get-Item $exe).VersionInfo.ProductVersion
+  Log "User '$profilePath' Teams.exe version: $ver"
+
+  if ($ApprovedVersions -contains $ver) {
+    Log "Approved version; skip per-user removal."
+    return
+  }
+
+  $upd = Join-Path $profilePath "AppData\Local\Microsoft\Teams\Update.exe"
+  if (Test-Path $upd) {
+    Start-Process $upd -ArgumentList "--uninstall -s" -Wait -ErrorAction SilentlyContinue
+    Log "Executed Update.exe --uninstall"
+  }
+
+  foreach ($p in @("AppData\Local\Microsoft\Teams","AppData\Roaming\Microsoft\Teams")) {
+    $full = Join-Path $profilePath $p
+    if (Test-Path $full) {
+      Remove-Item $full -Recurse -Force -ErrorAction SilentlyContinue
+      Log "Deleted folder: $full"
+    }
+  }
+}
+
+
+function Clean-RegistryForHive {
+  param([string]$HiveRoot)
+
   $targets = @(
     "$HiveRoot\Software\Microsoft\Windows\CurrentVersion\Uninstall\Teams",
     "$HiveRoot\Software\Microsoft\Office\Teams",
     "$HiveRoot\Software\Microsoft\Teams",
-    "$HiveRoot\Software\Microsoft\Windows\CurrentVersion\Run" # (old auto-starts)
+    "$HiveRoot\Software\Microsoft\Windows\CurrentVersion\Run"
   )
-  foreach($key in $targets){
-    if(Test-Path $key){
-      # If Uninstall\Teams exists, check DisplayVersion to keep/clear correctly
-      if($key -like "*Uninstall\Teams"){
-        try{
-          $dv = (Get-ItemProperty -Path $key -ErrorAction Stop).DisplayVersion
-          if($dv -and ($ApprovedVersions -contains $dv)){
-            Log "Registry uninstall entry is approved ($dv); keep: $key"
-          } else {
-            Remove-Item $key -Recurse -Force -ErrorAction SilentlyContinue
-            Log "Removed registry key (unapproved or no version): $key"
-          }
-        } catch {
-          Remove-Item $key -Recurse -Force -ErrorAction SilentlyContinue
-          Log "Removed registry key (failed to read, assumed stale): $key"
-        }
-      } else {
-        # Non-versioned Teams keys—safe to remove if present (they often reference old installs)
-        Remove-Item $key -Recurse -Force -ErrorAction SilentlyContinue
-        Log "Removed registry key: $key"
-      }
+
+  foreach ($key in $targets) {
+    if (Test-Path $key) {
+      Remove-Item $key -Recurse -Force -ErrorAction SilentlyContinue
+      Log "Removed registry key in hive: $key"
     }
   }
 }
 
-function Load-UserHive($Profile){
+function Load-UserHive {
+  param($Profile)
+
   $nt = Join-Path $Profile.LocalPath "NTUSER.DAT"
-  if(!(Test-Path $nt)){ return $null }
-  $mount = "HKU\TempHive-" + ([IO.Path]::GetFileName($Profile.LocalPath))
-  $loaded = (reg.exe load $mount $nt 2>&1 | Out-String)
-  if($LASTEXITCODE -eq 0){ return "HKU:\TempHive-$([IO.Path]::GetFileName($Profile.LocalPath))" }
+  if (!(Test-Path $nt)) { return $null }
+
+  $mountName = "TempHive-" + ([IO.Path]::GetFileName($Profile.LocalPath))
+  $mount = "HKU\$mountName"
+
+  reg.exe load $mount $nt 2>&1 | Out-Null
+  if ($LASTEXITCODE -eq 0) {
+    Log "Loaded hive: $mount"
+    return "HKU:\$mountName"
+  }
+
   return $null
 }
 
-function Unload-UserHive($MountHKU){
-  if($MountHKU){ reg.exe unload ($MountHKU -replace "HKU:\\","HKU\") | Out-Null }
-}
+function Unload-UserHive {
+  param([string]$MountHKU)
 
-# ------- PER-USER FILE + REGISTRY -------
-# Handle ALL profiles, even when users are logged off
-Get-CimInstance Win32_UserProfile | Where-Object { $_.LocalPath -like "C:\Users\*" -and -not $_.Special } | ForEach-Object {
-  $p = $_
-  try{
-    Remove-PerUserTeams -profilePath $p.LocalPath
-
-    # Load user registry hive, clean, unload
-    $h = Load-UserHive -Profile $p
-    if($h){ Clean-RegistryForHive -HiveRoot $h; Unload-UserHive -MountHKU $h }
-  } catch { Log "Error for profile '$($p.LocalPath)': $_" }
-}
-
-# ------- MACHINE-WIDE INSTALLER (MSI) -------
-# Avoid Win32_Product (slow & reconfigures MSI). Read uninstall registry instead.
-$hklmUninst = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
-$hklmUninstWow = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
-$mw = Get-ChildItem $hklmUninst,$hklmUninstWow -ErrorAction SilentlyContinue |
-      Where-Object { (Get-ItemProperty $_.PsPath -ErrorAction SilentlyContinue).DisplayName -match "Teams Machine-Wide Installer" }
-
-foreach($k in $mw){
-  $p = Get-ItemProperty $k.PsPath -ErrorAction SilentlyContinue
-  $dv = $p.DisplayVersion
-  $uninst = $p.UninstallString
-  if([string]::IsNullOrWhiteSpace($dv) -or ($ApprovedVersions -notcontains $dv)){
-    Log "Removing Machine-Wide Installer (version: $dv)"
-    if($uninst){
-      # Normalize msiexec command
-      if($uninst -notmatch "/x"){ $uninst = "msiexec.exe /x $($p.PSChildName)" }
-      Start-Process "cmd.exe" -ArgumentList "/c $uninst /qn /norestart" -Wait
-    } else {
-      # Known product code fallback (classic Teams MSI)
-      Start-Process "msiexec.exe" -ArgumentList "/x {731F6BAA-A986-45A4-8936-7C3AAAAA760B} /qn /norestart" -Wait
-    }
-    # Remove the uninstall key if version wasn’t approved
-    Remove-Item $k.PsPath -Recurse -Force -ErrorAction SilentlyContinue
-  } else {
-    Log "Machine-Wide Installer is approved ($dv); keeping."
+  if ($MountHKU -match "^HKU:\\(.+)$") {
+    $raw = "HKU\" + $Matches[1]
+    reg.exe unload $raw 2>&1 | Out-Null
+    Log "Unloaded hive: $raw"
   }
 }
 
-# ------- WINDOWS APPS (MSIX) -------
+
+# ------- PER-USER CLEANUP -------
+Get-CimInstance Win32_UserProfile |
+  Where-Object { $_.LocalPath -like "C:\Users\*" -and -not $_.Special } |
+  ForEach-Object {
+    $p = $_
+
+    Remove-PerUserTeams -profilePath $p.LocalPath
+
+    $hive = Load-UserHive -Profile $p
+    if ($hive) {
+      Clean-RegistryForHive -HiveRoot $hive
+      Unload-UserHive -MountHKU $hive
+    }
+  }
+
+
+# ------- MACHINE-WIDE INSTALLER -------
+$uninstRoots = @(
+  "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+  "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+)
+
+foreach ($root in $uninstRoots) {
+  if (Test-Path $root) {
+    Get-ChildItem $root | ForEach-Object {
+      try {
+        $p = Get-ItemProperty $_.PsPath -ErrorAction SilentlyContinue
+        if ($p.DisplayName -match "Teams Machine-Wide Installer") {
+          $dv = $p.DisplayVersion
+          if ($ApprovedVersions -notcontains $dv) {
+            Log "Removing machine-wide installer (version $dv)"
+            $cmd = $p.UninstallString
+            if ($cmd) {
+              Start-Process "cmd.exe" -ArgumentList "/c $cmd /qn /norestart" -Wait
+            }
+            Remove-Item $_.PsPath -Recurse -Force
+          }
+        }
+      } catch {}
+    }
+  }
+}
+
+
+# ------- WINDOWSAPPS (MSIX) — WITH SYSTEM FIX -------
 $appsDir = "C:\Program Files\WindowsApps"
-if(Test-Path $appsDir){
-  Get-ChildItem $appsDir -Directory -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -like "MSTeams*" } |
-    ForEach-Object {
-      if($_.Name -match "\d+\.\d+\.\d+\.\d+"){
-        $ver = $matches[0]
-        if($ApprovedVersions -notcontains $ver){
-          Log "Removing vulnerable WindowsApps package folder ($ver): $($_.Name)"
-          takeown /f $_.FullName /r /d y | Out-Null
-          icacls $_.FullName /grant administrators:F /t | Out-Null
-          Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
-        } else { Log "Approved WindowsApps version ($ver): keep." }
-      } else {
-        # Unknown/no version in name – be conservative: leave it
-        Log "WindowsApps folder w/o version skipped: $($_.Name)"
+
+if (Test-Path $appsDir) {
+  Get-ChildItem $appsDir -Directory | Where-Object { $_.Name -like "msteams*" } | ForEach-Object {
+
+    if ($_.Name -match "\d+\.\d+\.\d+\.\d+") {
+      $ver = $matches[0]
+
+      if ($ApprovedVersions -notcontains $ver) {
+
+        Log "Removing MSIX folder ($ver): $($_.Name)"
+
+        # SYSTEM ACL FIX
+        takeown /f $_.FullName /r /d y | Out-Null
+        icacls $_.FullName /grant SYSTEM:F /t /c | Out-Null
+        icacls $_.FullName /grant administrators:F /t /c | Out-Null
+        attrib -r -s -h $_.FullName /d /s | Out-Null
+
+        Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+      }
+      else {
+        Log "Keeping approved MSIX version: $ver"
       }
     }
+  }
 }
 
-# --- STEP: Clean unexpected Teams installs in C:\ProgramData\<User>\Microsoft\Teams ---
 
+# ------- PROGRAMDATA GHOST INSTALLS -------
 $pdRoot = "C:\ProgramData"
-Get-ChildItem $pdRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
-    $maybeUser = $_.FullName
-    $teamsPath = Join-Path $maybeUser "Microsoft\Teams\current\Teams.exe"
-
-    if (Test-Path $teamsPath) {
-        Write-Log "Found unexpected Teams install at: $teamsPath"
-
-        # Remove whole Microsoft\Teams folder
-        $rootFolder = Join-Path $maybeUser "Microsoft\Teams"
-        try {
-            Remove-Item $rootFolder -Recurse -Force -ErrorAction SilentlyContinue
-            Write-Log "Removed Teams folder under ProgramData: $rootFolder"
-        } catch {
-            Write-Log "Failed to remove: $rootFolder. Error: $_"
-        }
-    }
+Get-ChildItem $pdRoot -Directory | ForEach-Object {
+  $teams = Join-Path $_.FullName "Microsoft\Teams\current\Teams.exe"
+  if (Test-Path $teams) {
+    $rootFolder = Join-Path $_.FullName "Microsoft\Teams"
+    Log "Removing ProgramData Teams folder: $rootFolder"
+    Remove-Item $rootFolder -Recurse -Force -ErrorAction SilentlyContinue
+  }
 }
 
 
-# ------- APPX REGISTRY STUBS (defender evidence sometimes lingers here) -------
+# ------- APPX REGISTRY CLEANUP -------
 $AppxStores = @(
   "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\Applications",
   "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\DeployedPackages"
 )
-foreach($store in $AppxStores){
-  if(Test-Path $store){
-    Get-ChildItem $store -ErrorAction SilentlyContinue | Where-Object {$_.PSChildName -like "*MSTeams*"} | ForEach-Object {
-      $name = $_.PSChildName
-      $verMatch = ($name -match "\d+\.\d+\.\d+\.\d+"); $ver = $null; if($verMatch){ $ver = $matches[0] }
-      if(!$ver -or ($ApprovedVersions -notcontains $ver)){
+
+foreach ($store in $AppxStores) {
+  if (Test-Path $store) {
+    Get-ChildItem $store | Where-Object { $_.PSChildName -like "*msteams*" } | ForEach-Object {
+
+      $ver = $null
+      if ($_.PSChildName -match "\d+\.\d+\.\d+\.\d+") { $ver = $matches[0] }
+
+      if ($ApprovedVersions -notcontains $ver) {
+        Log "Removing AppX store entry: $($_.PSChildName)"
         Remove-Item $_.PsPath -Recurse -Force -ErrorAction SilentlyContinue
-        Log "Removed Appx store entry: $name (version: $ver)"
-      } else { Log "Kept Appx store entry (approved): $name" }
+      }
+      else {
+        Log "Keeping AppX entry (approved): $ver"
+      }
     }
   }
 }
 
-# --- STEP: Final deep registry cleanup for stale Teams entries ---
-Write-Log "Starting deep registry cleanup for leftover Teams registry entries..."
 
-$RegPaths = @(
+# ------- EXTRA HKLM/HKCU CLEANUP -------
+$extraRoots = @(
   "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
   "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
-  "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
-  "HKCU:\SOFTWARE\Microsoft\Office\Teams",
-  "HKCU:\SOFTWARE\Microsoft\Teams"
+  "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
 )
 
-foreach ($path in $RegPaths) {
-    if (Test-Path $path) {
-        Get-ChildItem $path -ErrorAction SilentlyContinue | ForEach-Object {
-            try {
-                $props = Get-ItemProperty $_.PsPath -ErrorAction SilentlyContinue
-                if ($props.DisplayName -match "Teams") {
-                    $ver = $props.DisplayVersion
-                    if ([string]::IsNullOrWhiteSpace($ver) -or ($ver -match "1\.25\.24601")) {
-                        Write-Log "Removing stale registry entry: $($_.PsPath) (version: $ver)"
-                        Remove-Item $_.PsPath -Recurse -Force -ErrorAction SilentlyContinue
-                    }
-                }
-            } catch { }
+foreach ($root in $extraRoots) {
+  if (Test-Path $root) {
+    Get-ChildItem $root | ForEach-Object {
+      try {
+        $p = Get-ItemProperty $_.PsPath
+        if ($p.DisplayName -match "Teams") {
+          $ver = $p.DisplayVersion
+          if ($ApprovedVersions -notcontains $ver) {
+            Log "Removing stale uninstall key: $($_.PsPath)"
+            Remove-Item $_.PsPath -Recurse -Force -ErrorAction SilentlyContinue
+          }
         }
+      } catch {}
     }
+  }
 }
-Write-Log "Registry cleanup completed."
 
-# --- STEP: Deep cleanup for HKU per-user uninstall entries ---
-Write-Log "Checking HKEY_USERS hives for stale Teams uninstall keys..."
 
-Get-ChildItem "HKU:\" -ErrorAction SilentlyContinue | ForEach-Object {
-    $sid = $_.PSChildName
-    $keyPath = "HKU:\$sid\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Teams"
-    if (Test-Path $keyPath) {
-        try {
-            $props = Get-ItemProperty $keyPath -ErrorAction SilentlyContinue
-            $ver = $props.DisplayVersion
-            if ([string]::IsNullOrWhiteSpace($ver) -or ($ApprovedVersions -notcontains $ver)) {
-                Write-Log "Removing per-user Teams uninstall key under $sid (version: $ver)"
-                Remove-Item $keyPath -Recurse -Force -ErrorAction SilentlyContinue
-            } else {
-                Write-Log "Approved version found in HKU\$sid, keeping key."
-            }
-        } catch {
-            Write-Log "Error accessing $keyPath : $_"
-        }
-    }
+# ------- HKU CLEANUP -------
+Log "Cleaning HKU uninstall keys..."
+
+Get-ChildItem "HKU:\" | ForEach-Object {
+  $key = "HKU:\$($_.PSChildName)\Software\Microsoft\Windows\CurrentVersion\Uninstall\Teams"
+  if (Test-Path $key) {
+    try {
+      $v = (Get-ItemProperty $key).DisplayVersion
+      if ($ApprovedVersions -notcontains $v) {
+        Log "Removing HKU uninstall key for SID $($_.PSChildName) (version $v)"
+        Remove-Item $key -Recurse -Force -ErrorAction SilentlyContinue
+      }
+    } catch {}
+  }
 }
-Write-Log "Completed HKU hive cleanup."
 
 
-Log "Teams remediation + registry cleanup complete."
+Log "===== Teams remediation complete ====="
